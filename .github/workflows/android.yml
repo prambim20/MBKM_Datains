@@ -1,0 +1,274 @@
+---
+name: 📱 Android
+on:
+  push:
+    branches:
+      - master
+      - release-**
+  pull_request:
+  release:
+    types: ['published']
+
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - triplet: 'arm64-android'
+            all_files_access: 'OFF'
+          - triplet: 'arm-android'
+            all_files_access: 'OFF'
+          - triplet: 'x64-android'
+            all_files_access: 'OFF'
+          - triplet: 'x86-android'
+            all_files_access: 'OFF'
+
+    steps:
+      - name: 🐣 Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+
+      - name: 🌾 Prepare vars
+        id: vars
+        shell: bash
+        run: |
+          echo "ANDROID_NDK_VERSION=22.1.7171670" >> $GITHUB_ENV
+          echo "ANDROID_BUILD_TOOLS_VERSION=29.0.2" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=/usr/local/lib/android/sdk/ndk/22.1.7171670" >> $GITHUB_ENV
+          echo "ndk.dir=$ANDROID_NDK_HOME" >> local.properties
+          ALL_FILES_ACCESS=${{ matrix.all_files_access }} ./scripts/ci/env_gh.sh
+
+          BUILD_ROOT="/home/runner"
+          echo "::set-output name=SYSTEM_QT::ON"
+          echo "::set-output name=PATHCONVERT::echo"
+          echo "::set-output name=INSTALL_QT::true"
+          echo "::set-output name=BUILD_TYPE::Release"
+          echo "::set-output name=BUILD_ROOT::${BUILD_ROOT}"
+
+          echo "CMAKE_BUILD_DIR=${BUILD_ROOT}/builddir" >> $GITHUB_ENV
+
+      - name: 🐩 Install CMake and Ninja
+        uses: lukka/get-cmake@latest
+
+      - name: 💐 Install Qt
+        if: ${{ steps.vars.outputs.INSTALL_QT }}
+        uses: jurplel/install-qt-action@v3
+        with:
+          version: 5.14.2
+          modules: 'qtcharts'
+          target: 'android'
+          arch: 'android'
+          cache: true
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: ${{ matrix.triplet }}
+          max-size: 200M
+
+      # The sentry-android dependency is added via gradle
+      # This downloads the pre-compiled sentry-android-ndk libraries
+      # But we are compiling this before gradle is executed, so it is not downloaded
+      # Therefore we download it manually to get include headers and libraries
+      # ... a better implementation of this much appreciated ...
+      - name: Download sentry libs
+        run: |
+          mkdir /tmp/sentry-android-ndk
+          wget https://repo1.maven.org/maven2/io/sentry/sentry-android-ndk/5.5.2/sentry-android-ndk-5.5.2.aar -O /tmp/sentry.zip
+          unzip /tmp/sentry.zip -d /tmp/sentry-android-ndk
+
+      - name: 🌱 Update ndk
+        run: |
+          echo "ndk.dir=$ANDROID_NDK_HOME" >> local.properties
+          echo "yes" | sudo /usr/local/lib/android/sdk/tools/bin/sdkmanager --uninstall "ndk-bundle"
+          echo "yes" | sudo /usr/local/lib/android/sdk/tools/bin/sdkmanager "platforms;android-30" "build-tools;$ANDROID_BUILD_TOOLS_VERSION" "ndk;$ANDROID_NDK_VERSION" tools platform-tools
+          echo "yes" | sudo /usr/local/lib/android/sdk/tools/bin/sdkmanager --licenses
+
+      - name: 🌱 Install dependencies and generate project files
+        env:
+          WORKSPACE: ${{ github.workspace }}
+        run: |
+          # Convert paths to bash compatible ones. Thanks to whoever decided to use drive letters and backslashes.
+          CMAKE_BUILD_DIR=$( ${{ steps.vars.outputs.PATHCONVERT }} "${CMAKE_BUILD_DIR}" )
+          SOURCE_DIR=$( ${{ steps.vars.outputs.PATHCONVERT }} "${WORKSPACE}" )
+
+          TRIPLET=${{ matrix.triplet }} ALL_FILES_ACCESS=${{ matrix.all_files_access }} source ./scripts/version_number.sh
+          TRIPLET=${{ matrix.triplet }} ALL_FILES_ACCESS=${{ matrix.all_files_access }} source ./scripts/ci/generate-version-details.sh
+
+          cmake -S "${SOURCE_DIR}" \
+                -B "${CMAKE_BUILD_DIR}" \
+                -G Ninja \
+                -D CMAKE_BUILD_TYPE=${{ steps.vars.outputs.BUILD_TYPE }} \
+                -D CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                -D SYSTEM_QT=ON \
+                -D ANDROID_SDK=/usr/local/lib/android/sdk/ \
+                -D ANDROID_NDK_VERSION="${ANDROID_NDK_VERSION}" \
+                -D ANDROID_BUILD_TOOLS_VERSION="${ANDROID_BUILD_TOOLS_VERSION}" \
+                -D VCPKG_TARGET_TRIPLET="${{ matrix.triplet }}" \
+                -D WITH_ALL_FILES_ACCESS="${{ matrix.all_files_access }}" \
+                -D WITH_SPIX=OFF \
+                -D APP_VERSION="${APP_VERSION}" \
+                -D APK_VERSION_CODE="${APK_VERSION_CODE}" \
+                -D APP_VERSION_STR="${APP_VERSION_STR}" \
+                -D APP_PACKAGE_NAME="${APP_PACKAGE_NAME}" \
+                -D APP_ICON="${APP_ICON}" \
+                -D APP_NAME="${APP_NAME}" \
+                -D NUGET_USERNAME=opengisch \
+                -D NUGET_TOKEN=${{ secrets.GITHUB_TOKEN }} \
+                -D SENTRY_DSN=${{ secrets.SENTRY_DSN }} \
+                -D SENTRY_ENV="${APP_ENV}" \
+                -D SENTRY_IMPORT_PREFIX=/tmp/sentry-android-ndk/jni
+
+      - name: 📑 Upload Dep Build Logs
+        uses: actions/upload-artifact@v3
+        if: failure()
+        with:
+          name: build-logs-${{ matrix.triplet }}
+          path: |
+            ${{ env.CMAKE_BUILD_DIR }}/vcpkg-manifest-install.log
+            ${{ github.workspace }}/vcpkg/base/buildtrees/**/*.log
+
+            ${{ github.workspace }}/vcpkg/base/buildtrees/**/*.log
+
+      - name: 🌋 Build
+        run: |
+          cmake --build "${{ env.CMAKE_BUILD_DIR }}" --config ${{ steps.vars.outputs.BUILD_TYPE }} # --target qfield
+
+
+      - name: Setup signing key
+        env:
+          SIGNINGKEY: ${{ secrets.PLAYSTORE_SIGNINGKEY }}
+        run: |
+          echo "$SIGNINGKEY" | base64 --decode > ./keystore.p12
+
+      - name: Package
+        env:
+          KEYNAME: qfield
+          KEYPASS: ${{ secrets.KEYPASS }}
+          STOREPASS: ${{ secrets.STOREPASS }}
+        run: |
+          cmake --build  "${{ env.CMAKE_BUILD_DIR }}" --target bundle --config Release
+
+      - name: 📦 Upload artifacts
+        uses: actions/upload-artifact@v3
+        if: ${{ matrix.all_files_access }} == "OFF"
+        with:
+          name: android-${{ matrix.triplet }}
+          path: |
+            ${{ env.CMAKE_BUILD_DIR }}/android-build/build/outputs/apk/release/android-build-release-signed.apk
+
+      - name: 📦 Upload plus artifacts
+        uses: actions/upload-artifact@v3
+        if: ${{ matrix.all_files_access }} == "ON"
+        with:
+          name: android-plus-${{ matrix.triplet }}
+          path: |
+            ${{ env.CMAKE_BUILD_DIR }}/android-build/build/outputs/apk/release/android-build-release-signed.apk
+
+      - name: 🍺 Deploy
+        run: |
+          sudo apt install -y s3cmd
+          TRIPLET=${{ matrix.triplet }} ALL_FILES_ACCESS=${{ matrix.all_files_access }} ./scripts/ci/upload_artifacts.sh
+        env:
+          S3CFG: ${{ secrets.S3CFG }}
+
+      - name: Upload release assets
+        uses: AButler/upload-release-assets@v2.0
+        if: ${{ github.event_name == 'release' }}
+        with:
+          files: /tmp/qfield-*.apk
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          release-tag: ${{ env.CI_TAG }}
+
+      - name: Upload debug symbols
+        # if: release or labeled PR
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        run: |
+          curl -sL https://sentry.io/get-cli/ | bash
+          sentry-cli upload-dif -o opengisch -p qfield ${{ env.CMAKE_BUILD_DIR }}/android-build/build/intermediates/merged_native_libs/release
+
+  deploy_to_playstore:
+    runs-on: ubuntu-20.04
+    needs: build
+    if: ${{ github.event_name == 'released' || ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Vars
+        id: vars
+        run: |
+          ./scripts/ci/env_gh.sh
+
+      - name: Download apks
+        run: |
+          wget https://sos-ch-dk-2.exo.io/qfieldapks/ci-builds/${{ steps.vars.outputs.CI_PACKAGE_FILE_BASENAME }}-arm64-android.apk
+          wget https://sos-ch-dk-2.exo.io/qfieldapks/ci-builds/${{ steps.vars.outputs.CI_PACKAGE_FILE_BASENAME }}-arm-android.apk
+          wget https://sos-ch-dk-2.exo.io/qfieldapks/ci-builds/${{ steps.vars.outputs.CI_PACKAGE_FILE_BASENAME }}-x64-android.apk
+          wget https://sos-ch-dk-2.exo.io/qfieldapks/ci-builds/${{ steps.vars.outputs.CI_PACKAGE_FILE_BASENAME }}-x86-android.apk
+
+      - name: Upload to Google Play Store
+        run: |
+          pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib oauth2client
+
+          ./scripts/basic_upload_apks_service_account.py ch.opengis.${{ steps.vars.outputs.APP_PACKAGE_NAME }} beta "Update from commit ${GITHUB_SHA}" \
+              ${{ steps.vars.outputs.CI_PACKAGE_FILE_BASENAME }}-arm64-android.apk \
+              ${{ steps.vars.outputs.CI_PACKAGE_FILE_BASENAME }}-arm-android.apk \
+              ${{ steps.vars.outputs.CI_PACKAGE_FILE_BASENAME }}-x64-android.apk \
+              ${{ steps.vars.outputs.CI_PACKAGE_FILE_BASENAME }}-x86-android.apk
+        env:
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+
+
+  comment_pr:
+    runs-on: ubuntu-20.04
+    needs: build
+    if: ${{ github.event_name == 'pull_request' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Vars
+        id: vars
+        run: |
+          ./scripts/ci/env_gh.sh
+
+      - name: 💬 Create comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          GITHUB_TOKEN: ${{ secrets.FAIRY_TOKEN }}
+          message: |
+            🎉 Ta-daaa, freshly created APKs are available for ${{ github.event.pull_request.head.sha }}: [**arm64-android**](https://sos-ch-dk-2.exo.io/qfieldapks/ci-builds/${{ steps.vars.outputs.CI_PACKAGE_FILE_BASENAME }}-arm64-android.apk)
+            <details>
+            <summary>Other architectures</summary>
+
+            - [arm-android](https://sos-ch-dk-2.exo.io/qfieldapks/ci-builds/${{ steps.vars.outputs.CI_PACKAGE_FILE_BASENAME }}-arm-android.apk)
+            - [x64-android](https://sos-ch-dk-2.exo.io/qfieldapks/ci-builds/${{ steps.vars.outputs.CI_PACKAGE_FILE_BASENAME }}-x64-android.apk)
+            - [x86-android](https://sos-ch-dk-2.exo.io/qfieldapks/ci-builds/${{ steps.vars.outputs.CI_PACKAGE_FILE_BASENAME }}-x86-android.apk)
+            </details>
+
+  comment_commit:
+    runs-on: ubuntu-20.04
+    needs: build
+    if: ${{ github.event_name == 'push' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Vars
+        id: vars
+        run: |
+          ./scripts/ci/env_gh.sh
+      - name: Comment commit
+        uses: peter-evans/commit-comment@v2
+        with:
+          token: ${{ secrets.FAIRY_TOKEN }}
+          body: |
+            🎉 Ta-daaa, freshly created APKs are available:
+              - [**arm64-android**](https://sos-ch-dk-2.exo.io/qfieldapks/ci-builds/${{ steps.vars.outputs.CI_PACKAGE_FILE_BASENAME }}-arm64-android.apk)
+
+            Other architectures: [arm-android](https://sos-ch-dk-2.exo.io/qfieldapks/ci-builds/${{ steps.vars.outputs.CI_PACKAGE_FILE_BASENAME }}-arm-android.apk), [x64-android](https://sos-ch-dk-2.exo.io/qfieldapks/ci-builds/${{ steps.vars.outputs.CI_PACKAGE_FILE_BASENAME }}-x64-android.apk), [x86](https://sos-ch-dk-2.exo.io/qfieldapks/ci-builds/${{ steps.vars.outputs.CI_PACKAGE_FILE_BASENAME }}-x86-android.apkg)
+
